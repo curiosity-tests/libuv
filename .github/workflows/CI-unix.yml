@@ -84,7 +84,7 @@ jobs:
           make -C build distcheck
 
   build-android:
-    # racecar: compile happens inside an emulator/qemu, unobservable
+    # racecar: compile runs inside an Android emulator, unobservable
     if: false
     runs-on: ubuntu-latest
     env:
@@ -246,8 +246,6 @@ jobs:
           ls -lh build-ios
 
   build-cross-qemu:
-    # racecar: compile happens inside an emulator/qemu, unobservable
-    if: false
     runs-on: ubuntu-24.04
     name: build-cross-qemu-${{ matrix.config.target }}
 
