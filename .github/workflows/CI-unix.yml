@@ -1,6 +1,40 @@
 name: CI-unix
 
+# racecar fork-testbed patch. Changes from upstream:
+#   1. workflow_dispatch with a `leg` input so racecar can drive the run and pick
+#      baseline vs instrumented.
+#   2. actions/checkout -> crashappsec/action-checkout, which wraps checkout and
+#      setup-chalk-action; `chalk:` is the only variable separating the arms.
+#   3. permissions: id-token: write for the action's OIDC connect (the block
+#      zeroes unlisted scopes, so everything upstream relied on is restated).
+#   4. A fail-closed assertion on the instrumented arm.
+#   5. fail-fast: false on every matrix -- a measurement-integrity change, not a
+#      build change: the instrumented arm has strictly more failure surface, so
+#      leaving fail-fast on cancels instrumented siblings more often than
+#      baseline ones and biases the comparison.
+#   6. the concurrency group carries the leg. Both arms run on the same ref, so
+#      upstream's github.ref-keyed group put them in one group and the second
+#      dispatch cancelled the first. Also cancellation-only, never a build change.
+# Build and test COMMANDS are unchanged from upstream.
+
+run-name: "CI-unix ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
+
 on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   pull_request:
     paths:
       - '**'
@@ -13,13 +47,33 @@ on:
       - v[0-9].*
       - master
 
-permissions: read-all
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
 
 jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: configure
         run: |
           ./autogen.sh
@@ -30,11 +84,28 @@ jobs:
           make -C build distcheck
 
   build-android:
+    # racecar: compile happens inside an emulator/qemu, unobservable
+    if: false
     runs-on: ubuntu-latest
     env:
       ANDROID_AVD_HOME: /root/.android/avd
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: Envinfo
         run: npx envinfo
       - name: Enable KVM
@@ -78,13 +149,30 @@ jobs:
             adb shell "cd /data/local/tmp/build && env UV_TEST_TIMEOUT_MULTIPLIER=5 ./uv_run_tests_a"
 
   build-macos:
+    # racecar: non-Linux leg: observables are linux-only
+    if: false
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [macos-14, macos-15, macos-15-intel]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: Envinfo
         run: npx envinfo
       - name: Disable Firewall
@@ -125,13 +213,30 @@ jobs:
           make -C build-auto -j4
 
   build-ios:
+    # racecar: non-Linux leg: observables are linux-only
+    if: false
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [macos-14, macos-15]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: Configure
         run: |
           cmake -B build-ios -GXcode -DCMAKE_SYSTEM_NAME:STRING=iOS -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED:BOOL=NO -DCMAKE_CONFIGURATION_TYPES:STRING=Release
@@ -141,6 +246,8 @@ jobs:
           ls -lh build-ios
 
   build-cross-qemu:
+    # racecar: compile happens inside an emulator/qemu, unobservable
+    if: false
     runs-on: ubuntu-24.04
     name: build-cross-qemu-${{ matrix.config.target }}
 
@@ -166,7 +273,22 @@ jobs:
           - {target: ppc64 (u64 slots),   toolchain: gcc-powerpc64-linux-gnu,     cc: powerpc64-linux-gnu-gcc,    qemu: qemu-ppc64    }
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: Install qemu and ${{ matrix.config.toolchain }}
         run: |
           sudo apt update
