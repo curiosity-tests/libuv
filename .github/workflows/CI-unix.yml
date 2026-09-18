@@ -37,15 +37,15 @@ on:
         default: ""
   pull_request:
     paths:
-      - '**'
-      - '!docs/**'
-      - '!src/win/**'
-      - '!.**'
-      - '.github/workflows/CI-unix.yml'
+    - '**'
+    - '!docs/**'
+    - '!src/win/**'
+    - '!.**'
+    - '.github/workflows/CI-unix.yml'
   push:
     branches:
-      - v[0-9].*
-      - master
+    - v[0-9].*
+    - master
 
 permissions:
   contents: read
@@ -58,31 +58,99 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
+    - uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
 
-      - name: Assert instrumentation is live
-        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
-        # LD_PRELOAD once it has injected, so an empty value is what success
-        # looks like. co-hostd also daemonizes, so pgrep does not match it.
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: configure
+      run: |
+        ./autogen.sh
+        mkdir build
+        (cd build && ../configure)
+    - name: distcheck
+      run: |
+        make -C build distcheck
 
-      - name: configure
-        run: |
-          ./autogen.sh
-          mkdir build
-          (cd build && ../configure)
-      - name: distcheck
-        run: |
-          make -C build distcheck
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   build-android:
     # racecar: compile runs inside an Android emulator, unobservable
     if: false
@@ -90,161 +158,132 @@ jobs:
     env:
       ANDROID_AVD_HOME: /root/.android/avd
     steps:
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
+    - uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
 
-      - name: Assert instrumentation is live
-        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
-        # LD_PRELOAD once it has injected, so an empty value is what success
-        # looks like. co-hostd also daemonizes, so pgrep does not match it.
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Envinfo
+      run: npx envinfo
+    - name: Enable KVM
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+    - name: Build and Test
+      uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d   # v2
+      with:
+        api-level: 30
+        arch: x86_64
+        target: google_apis
+        ram-size: 2048M
+        emulator-options: -no-audio -no-window -gpu off -no-boot-anim -netdelay none -netspeed full -writable-system -no-snapshot-save -no-snapshot-load -no-snapshot
+        disable-animations: true
+        script: |
+          echo "::group::Configure"
+          cmake -B build -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DANDROID_ABI="x86_64" -DANDROID_PLATFORM=android-30
+          echo "::endgroup::"
 
-      - name: Envinfo
-        run: npx envinfo
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Build and Test
-        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
-        with:
-          api-level: 30
-          arch: x86_64
-          target: google_apis
-          ram-size: 2048M
-          emulator-options: -no-audio -no-window -gpu off -no-boot-anim -netdelay none -netspeed full -writable-system -no-snapshot-save -no-snapshot-load -no-snapshot
-          disable-animations: true
-          script: |
-            echo "::group::Configure"
-            cmake -B build -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DANDROID_ABI="x86_64" -DANDROID_PLATFORM=android-30
-            echo "::endgroup::"
-
-            echo "::group::Build"
-            cmake --build build
-
-            ## Correct some ld bugs that cause problems with libuv tests
-            wget "https://github.com/termux/termux-elf-cleaner/releases/download/v2.2.1/termux-elf-cleaner" -P build
-            chmod a+x build/termux-elf-cleaner
-            build/termux-elf-cleaner --api-level 30 ./build/uv_run_tests
-            build/termux-elf-cleaner --api-level 30 ./build/uv_run_tests_a
-
-            adb shell "su 0 setenforce 0" # to allow some syscalls like link, chmod, etc.
-
-            ## Push the build and test fixtures to the device
-            adb push build /data/local/tmp
-            adb shell mkdir /data/local/tmp/build/test
-            adb push test/fixtures /data/local/tmp/build/test
-            echo "::endgroup::"
-
-            ## Run the tests
-            file build/uv_run_tests_a
-            adb shell "cd /data/local/tmp/build && env UV_TEST_TIMEOUT_MULTIPLIER=5 ./uv_run_tests_a"
-
-  build-macos:
-    # racecar: non-Linux leg: observables are linux-only
-    if: false
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-14, macos-15, macos-15-intel]
-    steps:
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-
-      - name: Assert instrumentation is live
-        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
-        # LD_PRELOAD once it has injected, so an empty value is what success
-        # looks like. co-hostd also daemonizes, so pgrep does not match it.
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
-
-      - name: Envinfo
-        run: npx envinfo
-      - name: Disable Firewall
-        run: |
-          /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
-          sudo defaults write /Library/Preferences/com.apple.alf globalstate -int 0
-          /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
-      - name: Setup
-        run: |
-          brew install ninja automake libtool
-      - name: Configure
-        run: |
-          cmake -B build -DBUILD_TESTING=ON -G Ninja
-      - name: Build
-        run: |
+          echo "::group::Build"
           cmake --build build
-          ls -lh
-      - name: platform_output
-        run: |
-          ./build/uv_run_tests platform_output
-      - name: platform_output_a
-        run: |
-          ./build/uv_run_tests_a platform_output
-      - name: Test
-        if: ${{ matrix.os == 'macos-15' || matrix.os == 'macos-15-intel' }}
-        run: |
-          cd build && sudo UV_RUN_AS_ROOT=1 ctest -V
-      - name: Test
-        if: ${{ matrix.os != 'macos-15' && matrix.os != 'macos-15-intel' }}
-        run: |
-          cd build && ctest -V
-      - name: Autotools configure
-        if: always()
-        run: |
-          ./autogen.sh
-          mkdir build-auto
-          (cd build-auto && ../configure)
-          make -C build-auto -j4
 
-  build-ios:
-    # racecar: non-Linux leg: observables are linux-only
-    if: false
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-14, macos-15]
-    steps:
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
+          ## Correct some ld bugs that cause problems with libuv tests
+          wget "https://github.com/termux/termux-elf-cleaner/releases/download/v2.2.1/termux-elf-cleaner" -P build
+          chmod a+x build/termux-elf-cleaner
+          build/termux-elf-cleaner --api-level 30 ./build/uv_run_tests
+          build/termux-elf-cleaner --api-level 30 ./build/uv_run_tests_a
 
-      - name: Assert instrumentation is live
-        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
-        # LD_PRELOAD once it has injected, so an empty value is what success
-        # looks like. co-hostd also daemonizes, so pgrep does not match it.
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+          adb shell "su 0 setenforce 0" # to allow some syscalls like link, chmod, etc.
 
-      - name: Configure
-        run: |
-          cmake -B build-ios -GXcode -DCMAKE_SYSTEM_NAME:STRING=iOS -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED:BOOL=NO -DCMAKE_CONFIGURATION_TYPES:STRING=Release
-      - name: Build
-        run: |
-          cmake --build build-ios
-          ls -lh build-ios
+          ## Push the build and test fixtures to the device
+          adb push build /data/local/tmp
+          adb shell mkdir /data/local/tmp/build/test
+          adb push test/fixtures /data/local/tmp/build/test
+          echo "::endgroup::"
 
+          ## Run the tests
+          file build/uv_run_tests_a
+          adb shell "cd /data/local/tmp/build && env UV_TEST_TIMEOUT_MULTIPLIER=5 ./uv_run_tests_a"
+
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   build-cross-qemu:
     runs-on: ubuntu-24.04
     name: build-cross-qemu-${{ matrix.config.target }}
@@ -253,51 +292,119 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - {target: arm,                 toolchain: gcc-arm-linux-gnueabi,       cc: arm-linux-gnueabi-gcc,      qemu: qemu-arm      }
-          - {target: armhf,               toolchain: gcc-arm-linux-gnueabihf,     cc: arm-linux-gnueabihf-gcc,    qemu: qemu-arm      }
-          - {target: aarch64,             toolchain: gcc-aarch64-linux-gnu,       cc: aarch64-linux-gnu-gcc,      qemu: qemu-aarch64  }
-          - {target: riscv64,             toolchain: gcc-riscv64-linux-gnu,       cc: riscv64-linux-gnu-gcc,      qemu: qemu-riscv64  }
-          - {target: ppc,                 toolchain: gcc-powerpc-linux-gnu,       cc: powerpc-linux-gnu-gcc,      qemu: qemu-ppc      }
-          - {target: ppc64,               toolchain: gcc-powerpc64-linux-gnu,     cc: powerpc64-linux-gnu-gcc,    qemu: qemu-ppc64    }
-          - {target: ppc64le,             toolchain: gcc-powerpc64le-linux-gnu,   cc: powerpc64le-linux-gnu-gcc,  qemu: qemu-ppc64le  }
-          - {target: s390x,               toolchain: gcc-s390x-linux-gnu,         cc: s390x-linux-gnu-gcc,        qemu: qemu-s390x    }
-          - {target: mips,                toolchain: gcc-mips-linux-gnu,          cc: mips-linux-gnu-gcc,         qemu: qemu-mips     }
-          - {target: mips64,              toolchain: gcc-mips64-linux-gnuabi64,   cc: mips64-linux-gnuabi64-gcc,  qemu: qemu-mips64   }
-          - {target: mipsel,              toolchain: gcc-mipsel-linux-gnu,        cc: mipsel-linux-gnu-gcc,       qemu: qemu-mipsel   }
-          - {target: mips64el,            toolchain: gcc-mips64el-linux-gnuabi64, cc: mips64el-linux-gnuabi64-gcc,qemu: qemu-mips64el }
-          - {target: arm (u64 slots),     toolchain: gcc-arm-linux-gnueabi,       cc: arm-linux-gnueabi-gcc,      qemu: qemu-arm      }
-          - {target: aarch64 (u64 slots), toolchain: gcc-aarch64-linux-gnu,       cc: aarch64-linux-gnu-gcc,      qemu: qemu-aarch64  }
-          - {target: ppc (u64 slots),     toolchain: gcc-powerpc-linux-gnu,       cc: powerpc-linux-gnu-gcc,      qemu: qemu-ppc      }
-          - {target: ppc64 (u64 slots),   toolchain: gcc-powerpc64-linux-gnu,     cc: powerpc64-linux-gnu-gcc,    qemu: qemu-ppc64    }
+        - {target: arm, toolchain: gcc-arm-linux-gnueabi, cc: arm-linux-gnueabi-gcc, qemu: qemu-arm}
+        - {target: armhf, toolchain: gcc-arm-linux-gnueabihf, cc: arm-linux-gnueabihf-gcc, qemu: qemu-arm}
+        - {target: aarch64, toolchain: gcc-aarch64-linux-gnu, cc: aarch64-linux-gnu-gcc, qemu: qemu-aarch64}
+        - {target: riscv64, toolchain: gcc-riscv64-linux-gnu, cc: riscv64-linux-gnu-gcc, qemu: qemu-riscv64}
+        - {target: ppc, toolchain: gcc-powerpc-linux-gnu, cc: powerpc-linux-gnu-gcc, qemu: qemu-ppc}
+        - {target: ppc64, toolchain: gcc-powerpc64-linux-gnu, cc: powerpc64-linux-gnu-gcc, qemu: qemu-ppc64}
+        - {target: ppc64le, toolchain: gcc-powerpc64le-linux-gnu, cc: powerpc64le-linux-gnu-gcc, qemu: qemu-ppc64le}
+        - {target: s390x, toolchain: gcc-s390x-linux-gnu, cc: s390x-linux-gnu-gcc, qemu: qemu-s390x}
+        - {target: mips, toolchain: gcc-mips-linux-gnu, cc: mips-linux-gnu-gcc, qemu: qemu-mips}
+        - {target: mips64, toolchain: gcc-mips64-linux-gnuabi64, cc: mips64-linux-gnuabi64-gcc, qemu: qemu-mips64}
+        - {target: mipsel, toolchain: gcc-mipsel-linux-gnu, cc: mipsel-linux-gnu-gcc, qemu: qemu-mipsel}
+        - {target: mips64el, toolchain: gcc-mips64el-linux-gnuabi64, cc: mips64el-linux-gnuabi64-gcc, qemu: qemu-mips64el}
+        - {target: arm (u64 slots), toolchain: gcc-arm-linux-gnueabi, cc: arm-linux-gnueabi-gcc, qemu: qemu-arm}
+        - {target: aarch64 (u64 slots), toolchain: gcc-aarch64-linux-gnu, cc: aarch64-linux-gnu-gcc, qemu: qemu-aarch64}
+        - {target: ppc (u64 slots), toolchain: gcc-powerpc-linux-gnu, cc: powerpc-linux-gnu-gcc, qemu: qemu-ppc}
+        - {target: ppc64 (u64 slots), toolchain: gcc-powerpc64-linux-gnu, cc: powerpc64-linux-gnu-gcc, qemu: qemu-ppc64}
 
     steps:
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
+    - uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
 
-      - name: Assert instrumentation is live
-        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
-        # LD_PRELOAD once it has injected, so an empty value is what success
-        # looks like. co-hostd also daemonizes, so pgrep does not match it.
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Install qemu and ${{ matrix.config.toolchain }}
+      run: |
+        sudo apt update
+        sudo apt install qemu-user qemu-user-binfmt ${{ matrix.config.toolchain }} -y
+    - name: Configure with ${{ matrix.config.cc }}
+      run: |
+        cmake -B build -DBUILD_TESTING=ON -DQEMU=ON -DCMAKE_C_COMPILER=${{ matrix.config.cc }}
+    - name: Build
+      run: |
+        cmake --build build
+        ls -lh build
+    - name: Test
+      run: |
+        ${{ matrix.config.qemu }} build/uv_run_tests_a
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
-      - name: Install qemu and ${{ matrix.config.toolchain }}
-        run: |
-          sudo apt update
-          sudo apt install qemu-user qemu-user-binfmt ${{ matrix.config.toolchain }} -y
-      - name: Configure with ${{ matrix.config.cc }}
-        run: |
-          cmake -B build -DBUILD_TESTING=ON -DQEMU=ON -DCMAKE_C_COMPILER=${{ matrix.config.cc }}
-      - name: Build
-        run: |
-          cmake --build build
-          ls -lh build
-      - name: Test
-        run: |
-          ${{ matrix.config.qemu }} build/uv_run_tests_a
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
